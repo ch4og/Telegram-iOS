@@ -5,10 +5,7 @@ import subprocess
 import sys
 
 def is_apple_silicon():
-    if platform.processor() == 'arm':
-        return True
-    else:
-        return False
+    return platform.machine() in ('arm64', 'aarch64') or platform.processor() in ('arm', 'arm64', 'aarch64')
 
 
 def get_clean_env(use_clean_env=True):

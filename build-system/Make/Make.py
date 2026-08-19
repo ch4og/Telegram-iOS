@@ -44,6 +44,7 @@ class BazelCommandLine:
         self.custom_target = None
         self.continue_on_error = False
         self.show_actions = False
+        self.disable_extensions = False
         self.enable_sandbox = False
         self.disable_provisioning_profiles = False
         self.profile_swift = False
@@ -123,6 +124,12 @@ class BazelCommandLine:
     def set_custom_target(self, target_name):
         self.custom_target = target_name
 
+    def set_disable_extensions(self, value):
+        self.disable_extensions = value
+
+    def set_disable_provisioning_profiles(self, value):
+        self.disable_provisioning_profiles = value
+
     def set_continue_on_error(self, continue_on_error):
         self.continue_on_error = continue_on_error
 
@@ -134,9 +141,6 @@ class BazelCommandLine:
 
     def set_split_swiftmodules(self, value):
         self.split_submodules = value
-
-    def set_disable_provisioning_profiles(self):
-        self.disable_provisioning_profiles = True
 
     def set_profile_swift(self, value):
         self.profile_swift = value
@@ -296,6 +300,8 @@ class BazelCommandLine:
         if self.enable_sandbox:
             combined_arguments += ['--spawn_strategy=sandboxed']
 
+        if self.disable_extensions:
+            combined_arguments += ['--//Telegram:disableExtensions']
         if self.disable_provisioning_profiles:
             combined_arguments += ['--//Telegram:disableProvisioningProfiles']
 
@@ -694,6 +700,8 @@ def build(bazel, arguments):
             print('TelegramBuild: warning: --embedWatchApp requires a device configuration (debug_arm64 or release_arm64); ignored for simulator builds.')
     bazel_command_line.set_build_number(arguments.buildNumber)
     bazel_command_line.set_custom_target(arguments.target)
+    bazel_command_line.set_disable_extensions(arguments.disableExtensions)
+    bazel_command_line.set_disable_provisioning_profiles(arguments.disableProvisioningProfiles)
     bazel_command_line.set_continue_on_error(arguments.continueOnError)
     bazel_command_line.set_show_actions(arguments.showActions)
     bazel_command_line.set_enable_sandbox(arguments.sandbox)
@@ -1055,6 +1063,18 @@ if __name__ == '__main__':
         default=False,
         help='Generate .swiftmodule files in parallel to building modules, can speed up compilation on multi-core '
              'systems. '
+    )
+    buildParser.add_argument(
+        '--disableExtensions',
+        action='store_true',
+        default=False,
+        help='Do not embed app extensions. Useful for reduced device builds.'
+    )
+    buildParser.add_argument(
+        '--disableProvisioningProfiles',
+        action='store_true',
+        default=False,
+        help='Build without provisioning profiles. Device output is unsigned and must be re-signed before installation.'
     )
     buildParser.add_argument(
         '--profileSwift',

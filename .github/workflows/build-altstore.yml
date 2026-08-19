@@ -1,0 +1,143 @@
+name: Build reduced AltStore IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Device build configuration
+        required: true
+        default: release_arm64
+        type: choice
+        options:
+          - release_arm64
+          - debug_arm64
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # The repository pins the arm64 Bazel checksum in versions.json. Use an
+    # Apple Silicon runner so BazelLocation.py selects the matching artifact.
+    runs-on: macos-26
+    timeout-minutes: 180
+
+    env:
+      BUILD_CONFIGURATION: ${{ inputs.configuration }}
+      TELEGRAM_BUILD_CONFIG_JSON: ${{ secrets.TELEGRAM_BUILD_CONFIG_JSON }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Select repository Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          XCODE_VERSION="$(python3 -c 'import json; print(json.load(open("versions.json"))["xcode"])')"
+          XCODE_DEVELOPER="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          test -d "$XCODE_DEVELOPER" || {
+            echo "Xcode $XCODE_VERSION is not installed on this runner" >&2
+            ls -1 /Applications/Xcode*.app 2>/dev/null || true
+            exit 1
+          }
+          sudo xcode-select -s "$XCODE_DEVELOPER"
+          xcodebuild -version
+
+      - name: Prepare private build configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${TELEGRAM_BUILD_CONFIG_JSON}" || {
+            echo "Set the TELEGRAM_BUILD_CONFIG_JSON repository secret" >&2
+            exit 1
+          }
+          CONFIG_PATH="$RUNNER_TEMP/telegram-build-configuration.json"
+          printf '%s' "$TELEGRAM_BUILD_CONFIG_JSON" > "$CONFIG_PATH"
+          python3 -m json.tool "$CONFIG_PATH" >/dev/null
+          echo "CONFIG_PATH=$CONFIG_PATH" >> "$GITHUB_ENV"
+
+      - name: Prepare temporary fake signing material
+        shell: bash
+        run: |
+          set -euo pipefail
+          CODESIGNING_PATH="$RUNNER_TEMP/codesigning"
+          mkdir -p "$CODESIGNING_PATH/certs" "$CODESIGNING_PATH/profiles"
+          cp build-system/fake-codesigning/certs/SelfSigned.p12 "$CODESIGNING_PATH/certs/"
+          cp build-system/fake-codesigning/certs/Public.cer "$CODESIGNING_PATH/certs/"
+
+          python3 build-system/Make/ImportCertificates.py \
+            --path build-system/fake-codesigning/certs
+
+          # The self-signed certificate is intentionally not trusted by macOS,
+          # so `security find-identity -p codesigning` reports zero identities.
+          # Use its certificate subject directly; security cms can still use the
+          # imported private key for signing the temporary profile.
+          IDENTITY="$(openssl pkcs12 -in build-system/fake-codesigning/certs/SelfSigned.p12 -passin pass: -nokeys -legacy | \
+            openssl x509 -noout -subject -nameopt oneline,-esc_msb | \
+            sed -E 's/^subject=.*CN[ =]+([^,]+).*/\1/')"
+          test -n "$IDENTITY" || {
+            echo "Could not extract the temporary fake signing identity" >&2
+            exit 1
+          }
+
+          BUNDLE_ID="$(python3 -c 'import json, os; print(json.load(open(os.environ["CONFIG_PATH"]))["bundle_id"])')"
+          TEAM_ID="$(python3 -c 'import json, os; print(json.load(open(os.environ["CONFIG_PATH"]))["team_id"])')"
+          python3 build-system/Make/GenerateFakeProvisioningProfile.py \
+            --source build-system/fake-codesigning/profiles/Telegram.mobileprovision \
+            --destination "$CODESIGNING_PATH/profiles/Telegram.mobileprovision" \
+            --bundle-id "$BUNDLE_ID" \
+            --team-id "$TEAM_ID" \
+            --certificate build-system/fake-codesigning/certs/Public.cer \
+            --keychain temp.keychain \
+            --identity "$IDENTITY"
+
+          echo "CODESIGNING_PATH=$CODESIGNING_PATH" >> "$GITHUB_ENV"
+
+      - name: Build fake-signed device IPA for AltStore
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_NUMBER_OFFSET="$(tr -d '[:space:]' < build_number_offset)"
+          COMMIT_COUNT="$(git rev-list --count HEAD)"
+          BUILD_NUMBER="$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))"
+          OUTPUT_PATH="$RUNNER_TEMP/telegram-artifacts"
+          rm -rf "$OUTPUT_PATH"
+          mkdir -p "$OUTPUT_PATH"
+
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$RUNNER_TEMP/bazel-root" \
+            --cacheDir="$RUNNER_TEMP/bazel-cache" \
+            build \
+            --configurationPath="$CONFIG_PATH" \
+            --codesigningInformationPath="$CODESIGNING_PATH" \
+            --disableExtensions \
+            --configuration="$BUILD_CONFIGURATION" \
+            --buildNumber="$BUILD_NUMBER" \
+            --outputBuildArtifactsPath="$OUTPUT_PATH"
+
+          test -s "$OUTPUT_PATH/Telegram.ipa"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+
+      - name: Verify IPA architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK_DIR="$RUNNER_TEMP/ipa-check"
+          rm -rf "$WORK_DIR"
+          mkdir -p "$WORK_DIR"
+          unzip -q "$RUNNER_TEMP/telegram-artifacts/Telegram.ipa" -d "$WORK_DIR"
+          APP_PATH="$(find "$WORK_DIR/Payload" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print:CFBundleExecutable' "$APP_PATH/Info.plist")"
+          lipo -info "$APP_PATH/$EXECUTABLE"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-${{ github.run_number }}-altstore
+          path: ${{ runner.temp }}/telegram-artifacts/Telegram.ipa
+          if-no-files-found: error
+          retention-days: 7
